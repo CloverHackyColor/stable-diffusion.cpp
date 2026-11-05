@@ -322,6 +322,12 @@ namespace Qwen {
                 h = ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate));
 
             }
+            // the tile loader rounds activations to half anyway; narrowing first halves the
+            // bytes the down projection re-reads for every row block
+            static const bool down_f16_off = getenv("TOSH_QWEN21_DOWN_F16_DISABLE") != nullptr;
+            if (!down_f16_off && h->type == GGML_TYPE_F32) {
+                h = ggml_cast(ctx->ggml_ctx, h, GGML_TYPE_F16);
+            }           
             h = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.out"])->forward(ctx, h);
             return ggml_add(ctx->ggml_ctx, x, modulate(ctx, h, modulation[3], prefix_length, true));
         }
