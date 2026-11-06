@@ -165,6 +165,23 @@ void StableDiffusionGGML::end_runners() {
             lora.model->runner_end();
 }
 
+// The sampler keeps the diffusion weights in video memory until the run ends, and the decoder
+// then has to fit next to them: on a 12 GB card a 4 GB transformer leaves under 2 GB and the
+// VAE decode fails. Only call this once no sampling pass is left.
+void StableDiffusionGGML::release_diffusion_weights() {
+    if (model_manager == nullptr) {
+        return;
+    }
+    // by component: a finished runner cannot always list its own parameters
+    for (const std::shared_ptr<DiffusionModelRunner>& runner : {diffusion_model, high_noise_diffusion_model}) {
+        if (runner != nullptr) {
+            runner->runner_end();
+        }
+    }
+    model_manager->unload_component(ModelComponent::Diffusion);
+    model_manager->unload_component(ModelComponent::HighNoiseDiffusion);
+}
+
 bool StableDiffusionGGML::reset_runners(const RunnerGroups& groups) {
     conditioning_cache_->clear();
     conditioning_loras_.clear();
@@ -993,6 +1010,30 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
         if (!max_vram_assignment.canonicalize_backend_keys(&error)) {
             LOG_ERROR("%s", error.c_str());
             return false;
+        }
+    }
+    // bf16 weights on a Metal device without the bfloat feature: every op that
+    // touches them is rejected, and the weight is already placed in the device
+    // buffer, so the load aborts instead of falling back. f16 keeps the same
+    // footprint; SD_BF16_PROMOTE_F32 trades 2 bytes per weight for the full
+    // exponent range if a model ever needs it.
+    {
+        const SDBackendModule modules[] = {SDBackendModule::DIFFUSION, SDBackendModule::TE,
+                                           SDBackendModule::CLIP_VISION, SDBackendModule::VAE,
+                                           SDBackendModule::CONTROL_NET};
+        bool bf16_supported = true;
+        for (SDBackendModule module : modules) {
+            for (ggml_backend_t backend : backend_manager.runtime_backends(module)) {
+                bf16_supported = bf16_supported && sd_backend_supports_bf16(backend);
+            }
+        }
+        if (!bf16_supported) {
+            ggml_type dst = getenv("SD_BF16_PROMOTE_F32") ? GGML_TYPE_F32 : GGML_TYPE_F16;
+            size_t n      = model_loader.override_unsupported_bf16(dst);
+            if (n > 0) {
+                LOG_INFO("device has no bfloat: converting %zu bf16 tensors to %s on load",
+                         n, ggml_type_name(dst));
+            }
         }
     }
     if (eager_load && graph_cut_layer_split_active()) {

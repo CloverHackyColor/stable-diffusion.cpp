@@ -16,6 +16,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "core/util.h"
 #include "model_io/gguf_io.h"
 #include "model_io/safetensors_io.h"
@@ -447,10 +450,33 @@ SDVersion ModelLoader::get_sd_version() const {
         return VERSION_FIBO2;
     }
 
-    if (tensor_storage_map.find("model.diffusion_model.emb_in.image.weight") != tensor_storage_map.end() &&
-        tensor_storage_map.find("model.diffusion_model.txt_mode_blocks.0.q_proj.weight") != tensor_storage_map.end()) {
+    // if (tensor_storage_map.find("model.diffusion_model.emb_in.image.weight") != tensor_storage_map.end() &&
+    //     tensor_storage_map.find("model.diffusion_model.txt_mode_blocks.0.q_proj.weight") != tensor_storage_map.end()) {
+    //     return VERSION_FLUX3;
+    // }
+
+        // === УСТОЙЧИВАЯ ПРОВЕРКА FLUX 3 (ищет подстроку, игнорируя префиксы) ===
+    bool has_flux3_emb = false;
+    bool has_flux3_txt = false;
+    
+    for (const auto& pair : tensor_storage_map) {
+        const std::string& name = pair.first;
+        if (name.find("emb_in.image.weight") != std::string::npos) {
+            has_flux3_emb = true;
+        }
+        if (name.find("txt_mode_blocks") != std::string::npos || name.find("single_blocks") != std::string::npos) {
+            has_flux3_txt = true;
+        }
+        // Если нашли оба признака, прерываем цикл досрочно для скорости
+        if (has_flux3_emb && has_flux3_txt) {
+            break;
+        }
+    }
+    
+    if (has_flux3_emb && has_flux3_txt) {
         return VERSION_FLUX3;
     }
+    // =======================================================================
 
     if (tensor_storage_map.count("model.diffusion_model.video_embedder.weight") &&
         tensor_storage_map.count("model.diffusion_model.shared_block_modulation.weight")) {
@@ -770,14 +796,21 @@ SDVersion ModelLoader::get_sd_version() const {
     return VERSION_COUNT;
 }
 
+// The type a tensor will actually be loaded as: an override wins over the type
+// the file stores it in, so the reported stats match what runs.
+static ggml_type effective_wtype(const TensorStorage& tensor_storage) {
+    return tensor_storage.expected_type != GGML_TYPE_COUNT ? tensor_storage.expected_type
+                                                           : tensor_storage.type;
+}
+
 std::map<ggml_type, uint32_t> ModelLoader::get_wtype_stat() const {
     std::map<ggml_type, uint32_t> wtype_stat;
     for (auto& [name, tensor_storage] : tensor_storage_map) {
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -793,11 +826,11 @@ std::map<ggml_type, uint32_t> ModelLoader::get_conditioner_wtype_stat() const {
             continue;
         }
 
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -810,11 +843,11 @@ std::map<ggml_type, uint32_t> ModelLoader::get_diffusion_model_wtype_stat() cons
             continue;
         }
 
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -828,11 +861,11 @@ std::map<ggml_type, uint32_t> ModelLoader::get_vae_wtype_stat() const {
             continue;
         }
 
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -897,6 +930,22 @@ void ModelLoader::set_wtype_override(ggml_type wtype, std::string tensor_type_ru
     }
     invalidate_file_data();
     ++revision_;
+}
+
+// Convert every bf16 tensor to `dst_type`, ignoring the name exclusions of
+// tensor_should_be_converted: those keep norms, biases and embeddings at the
+// file's own type, which on a backend without bf16 means the load aborts.
+// Returns how many tensors were retyped.
+size_t ModelLoader::override_unsupported_bf16(ggml_type dst_type) {
+    size_t count = 0;
+    for (auto& [name, tensor_storage] : tensor_storage_map) {
+        if (tensor_storage.type != GGML_TYPE_BF16) {
+            continue;
+        }
+        tensor_storage.expected_type = dst_type;
+        count++;
+    }
+    return count;
 }
 
 void ModelLoader::process_model_files(bool enable_mmap, bool writable_mmap) {
@@ -1195,7 +1244,17 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
 
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back([&, file_path, is_zip]() {
-                std::ifstream file;
+ //               std::ifstream file;
+                // pread, not ifstream: stdio refills in st_blksize units (4 KiB here), which
+                // turns one tensor into thousands of device requests (201 MB/s vs 3.1 GB/s).
+                struct PosixFile {
+                    int fd = -1;
+                    ~PosixFile() {
+                        if (fd >= 0) {
+                            close(fd);
+                        }
+                    }
+                } posix_file;
                 zip_t* zip = nullptr;
                 if (is_zip) {
                     zip = zip_open(file_path.c_str(), 0, 'r');
@@ -1205,8 +1264,11 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                         return;
                     }
                 } else if (!mmapped) {
-                    file.open(std::filesystem::u8path(file_path), std::ios::binary);
-                    if (!file.is_open()) {
+                    // file.open(std::filesystem::u8path(file_path), std::ios::binary);
+                    // if (!file.is_open()) {
+                    posix_file.fd = open(file_path.c_str(), O_RDONLY);
+                    if (posix_file.fd < 0) {
+
                         LOG_ERROR("failed to open '%s'", file_path.c_str());
                         failed = true;
                         return;
@@ -1305,11 +1367,22 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                 return false;
                             }
                         } else {
-                            file.seekg(tensor_storage.offset);
-                            file.read(buf, n);
-                            if (!file) {
-                                LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
-                                return false;
+                            // file.seekg(tensor_storage.offset);
+                            // file.read(buf, n);
+                            // if (!file) {
+                            //     LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
+                            //     return false;
+                            size_t done = 0;
+                            while (done < n) {
+                                ssize_t got = pread(posix_file.fd,
+                                                    buf + done,
+                                                    n - done,
+                                                    (off_t)(tensor_storage.offset + done));
+                                if (got <= 0) {
+                                    LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
+                                    return false;
+                                }
+                                done += (size_t)got;
                             }
                         }
                         return true;

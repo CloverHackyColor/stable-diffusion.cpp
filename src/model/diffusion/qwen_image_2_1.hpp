@@ -180,8 +180,12 @@ namespace Qwen {
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, const std::vector<QwenImage21Segment>& segments, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
             int64_t heads = x->ne[0] / dim_head;
+            // q, k and v read the same activation, which the tile loader rounds to half anyway
+            static const bool qkv_f16_off = getenv("TOSH_QWEN21_QKV_F16_DISABLE") != nullptr;
+            ggml_tensor* xin = !qkv_f16_off && x->type == GGML_TYPE_F32 ? ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16) : x;
+
             auto project  = [&](const char* name) {
-                auto h = std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, x);
+                auto h = std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, xin);
                 return ggml_reshape_4d(ctx->ggml_ctx, h, dim_head, heads, x->ne[1], x->ne[2]);
             };
             auto q = project("to_q");
@@ -211,7 +215,9 @@ namespace Qwen {
             }
             auto attend = [&](ggml_tensor* aq, ggml_tensor* ak, ggml_tensor* av, ggml_tensor* mask) {
                 bool used_flash_attn = false;
-                auto out             = ggml_ext_attention_ext(ctx, aq, ak, av, heads, mask, true, ctx->flash_attn_enabled, 1.f, &used_flash_attn);
+                //auto out             = ggml_ext_attention_ext(ctx, aq, ak, av, heads, mask, true, ctx->flash_attn_enabled, 1.f, &used_flash_attn);
+                static const bool v_view_off = getenv("TOSH_QWEN21_V_VIEW_DISABLE") != nullptr;
+                auto out             = ggml_ext_attention_ext(ctx, aq, ak, av, heads, mask, true, ctx->flash_attn_enabled, 1.f, &used_flash_attn, !v_view_off);
                 if (cache.flash_attn_used != nullptr) {
                     *cache.flash_attn_used &= used_flash_attn;
                 }
@@ -247,6 +253,10 @@ namespace Qwen {
             if (sd_backend_is(ctx->backend, "Vulkan") || sd_backend_is(ctx->backend, "ROCm")) {
                 to_out->set_force_prec_f32(true);
             }
+            static const bool out_f16_off = getenv("TOSH_QWEN21_OUT_F16_DISABLE") != nullptr;
+            if (!out_f16_off && result->type == GGML_TYPE_F32 && ggml_is_contiguous(result)) {
+                result = ggml_cast(ctx->ggml_ctx, result, GGML_TYPE_F16);
+            }
             return to_out->forward(ctx, result);
         }
     };
@@ -277,6 +287,11 @@ namespace Qwen {
             if (prefix_length == 0) {
                 return apply(x, rows[0]);
             }
+            // with no prefix the slice spans the whole tensor and would only copy it
+            static const bool modulate_view_off = getenv("TOSH_QWEN21_MODULATE_VIEW_DISABLE") != nullptr;
+            if (prefix_length == 0 && !modulate_view_off) {
+                return apply(x, rows[0]);
+            }
             auto target = apply(ggml_ext_slice(ctx, x, 1, prefix_length, x->ne[1]), rows[0]);
             auto prefix = apply(ggml_ext_slice(ctx, x, 1, 0, prefix_length), rows[1]);
             return ggml_concat(ctx, prefix, target, 1);
@@ -290,15 +305,40 @@ namespace Qwen {
             x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx, h, modulation[1], prefix_length, true));
             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
             h                           = modulate(ctx, h, modulation[2], prefix_length);
+            ggml_tensor* gate;
             auto fused                  = blocks.find("img_mlp.gate_up");
-            if (fused != blocks.end()) {
+//            if (fused != blocks.end()) {
+            static const bool swiglu_off = getenv("TOSH_QWEN21_SWIGLU_DISABLE") != nullptr;
+            if (fused != blocks.end() && !swiglu_off) {
+                // silu(gate) * up in one pass: chunking the fused output first copies both halves
+                static const bool gateup_f16_off = getenv("TOSH_QWEN21_GATEUP_F16_DISABLE") != nullptr;
+                if (!gateup_f16_off && h->type == GGML_TYPE_F32) {
+                    h = ggml_cast(ctx->ggml_ctx, h, GGML_TYPE_F16);
+                }
                 auto gate_up = std::dynamic_pointer_cast<Linear>(fused->second)->forward(ctx, h);
                 h            = ggml_swiglu(ctx->ggml_ctx, gate_up);
             } else {
-                auto gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
-                h         = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.proj"])->forward(ctx, h);
-                h         = ggml_swiglu_split(ctx->ggml_ctx, gate, h);
+                // auto gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
+                // h         = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.proj"])->forward(ctx, h);
+                // h         = ggml_swiglu_split(ctx->ggml_ctx, gate, h);
+                if (fused != blocks.end()) {
+                    auto gate_up = std::dynamic_pointer_cast<Linear>(fused->second)->forward(ctx, h);
+                    auto parts   = ggml_ext_chunk(ctx->ggml_ctx, gate_up, 2, 0);
+                    gate         = parts[0];
+                    h            = parts[1];
+                } else {
+                    gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
+                    h    = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.proj"])->forward(ctx, h);
+                }
+                h = ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate));
+
             }
+            // the tile loader rounds activations to half anyway; narrowing first halves the
+            // bytes the down projection re-reads for every row block
+            static const bool down_f16_off = getenv("TOSH_QWEN21_DOWN_F16_DISABLE") != nullptr;
+            if (!down_f16_off && h->type == GGML_TYPE_F32) {
+                h = ggml_cast(ctx->ggml_ctx, h, GGML_TYPE_F16);
+            }           
             h = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.out"])->forward(ctx, h);
             return ggml_add(ctx->ggml_ctx, x, modulate(ctx, h, modulation[3], prefix_length, true));
         }
