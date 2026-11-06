@@ -973,7 +973,9 @@ struct LoraModel : public GGMLRunner {
             }
 
             ggml_tensor* final_tensor;
-            if (model_tensor->type != GGML_TYPE_F32 && model_tensor->type != GGML_TYPE_F16) {
+            // f16 takes the same f32 round trip as the quantized types: the diff is f32, and a
+            // backend without host-visible weights cannot fall back to the CPU for a mixed add.            
+            if (model_tensor->type != GGML_TYPE_F32) {
                 final_tensor = ggml_ext_cast_f32(compute_ctx, runtime_backend, model_tensor);
                 final_tensor = ggml_add_inplace(compute_ctx, final_tensor, diff);
                 final_tensor = ggml_cpy(compute_ctx, final_tensor, model_tensor);
@@ -1068,7 +1070,7 @@ public:
                 continue;
             }
 
-            if (weight->type != GGML_TYPE_F32 && weight->type != GGML_TYPE_F16) {
+            if (weight->type != GGML_TYPE_F32) {
                 weight = ggml_ext_cast_f32(ctx, backend, weight);
             }
             weight = ggml_add(ctx, weight, diff);
@@ -1127,6 +1129,16 @@ public:
                                     ggml_tensor* output,
                                     const std::string& prefix,
                                     WeightAdapter::ForwardParams forward_params) override {
+        // Packed INT4 stores half the logical input width. Adapter shape checks
+        // and reshapes need the logical weight dimensions, without decoding it.
+        ggml_tensor logical_weight = *w;
+        if (forward_params.op_type == WeightAdapter::ForwardParams::op_type_t::OP_LINEAR &&
+            w->type == GGML_TYPE_I8 && x->ne[0] == 2 * w->ne[0]) {
+            logical_weight.ne[0] = x->ne[0];
+            for (int i = 1; i < GGML_MAX_DIMS; ++i)
+                logical_weight.nb[i] = logical_weight.nb[i - 1] * logical_weight.ne[i - 1];
+            w = &logical_weight;
+        }
         for (auto& lora_model : lora_models) {
             ggml_tensor* weight_diff = lora_model->get_weight_diff(prefix + "weight", backend, ctx, w, false);
             if (weight_diff != nullptr) {

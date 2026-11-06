@@ -675,7 +675,8 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                     bool flash_attn,
                                     float kv_scale,
                                     bool sage_attn,
-                                    bool* used_flash_attn) {  // avoid overflow
+                                    bool* used_flash_attn,
+                                    bool v_view) {  // avoid overflow
     if (used_flash_attn != nullptr) {
         *used_flash_attn = false;
     }
@@ -728,18 +729,29 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (kv_scale != 1.0f) {
             k_in = ggml_ext_scale(ctx, k_in, kv_scale);
         }
-        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+//        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        if (k_in->type != GGML_TYPE_F16) {
+            k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        }
 
         if (kv_scale != 1.0f) {
             v_in = ggml_ext_scale(ctx, v_in, kv_scale);
         }
         v_in       = ggml_permute(ctx, v_in, 0, 2, 1, 3);
+
         auto v_f16 = ggml_cast(ctx, v_in, GGML_TYPE_F16);
         if (!ggml_backend_supports_op(backend, v_f16)) {
             v_f16 = ggml_cast(ctx, ggml_ext_cont(ctx, v_in), GGML_TYPE_F16);
         }
-        v_in = v_f16;
-        v_in = ggml_reshape_3d(ctx, v_in, v_in->ne[0], L_k, n_kv_head * N);
+//        v_in = v_f16;
+//        v_in = ggml_reshape_3d(ctx, v_in, v_in->ne[0], L_k, n_kv_head * N);
+        if (v_view && v_in->type == GGML_TYPE_F16 && N == 1 && !pad_head && kv_scale == 1.0f) {
+            // the kernel follows v's row and head strides, so the permuted view needs no copy
+            v_in = ggml_permute(ctx, v_in, 0, 2, 1, 3);
+        } else {
+            v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
+            v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
+        }
 
         if (mask_in != nullptr) {
             // ggml_flash_attn_ext expects the mask as a contiguous F16 tensor shaped

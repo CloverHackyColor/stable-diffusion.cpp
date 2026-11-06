@@ -16,6 +16,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "core/util.h"
 #include "model_io/gguf_io.h"
 #include "model_io/safetensors_io.h"
@@ -447,7 +450,6 @@ SDVersion ModelLoader::get_sd_version() const {
         return VERSION_FIBO2;
     }
 
-    // === УСТОЙЧИВАЯ ПРОВЕРКА FLUX 3 (ищет подстроку, игнорируя префиксы) ===
     bool has_flux3_emb = false;
     bool has_flux3_txt = false;
     
@@ -536,7 +538,7 @@ SDVersion ModelLoader::get_sd_version() const {
         }
         if (tensor_storage.name.find("model.diffusion_model.transformer_blocks.0.img_mod.1.weight") != std::string::npos) {
             auto img_in = tensor_storage_map.find("model.diffusion_model.img_in.weight");
-            if (img_in != tensor_storage_map.end() && img_in->second.ne[0] == 128) {
+            if (img_in != tensor_storage_map.end() && img_in->second.logical_ne0() == 128) {
                 return VERSION_MAGE_FLOW;
             }
             if (tensor_storage_map.find("model.diffusion_model.time_text_embed.addition_t_embedding.weight") != tensor_storage_map.end()) {
@@ -611,7 +613,7 @@ SDVersion ModelLoader::get_sd_version() const {
                 }
             }
             auto connector = tensor_storage_map.find("embeddings_connectors.proj.weight");
-            if (connector != tensor_storage_map.end() && connector->second.ne[0] == 12800 &&
+            if (connector != tensor_storage_map.end() && connector->second.logical_ne0() == 12800 &&
                 connector->second.ne[1] == 5120 && tensor_storage_map.count("embeddings_connectors.sink_embedding")) {
                 return VERSION_P_H3_IMAGE;
             }
@@ -678,7 +680,7 @@ SDVersion ModelLoader::get_sd_version() const {
             tensor_storage.name.find("unet.up_blocks.2.attentions.1") != std::string::npos) {
             has_output_block_71 = true;
             if (tensor_storage.name.find("model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn1.to_k.weight") != std::string::npos) {
-                if (tensor_storage.ne[0] == 1024)
+                if (tensor_storage.logical_ne0() == 1024)
                     has_attn_1024 = true;
             }
         }
@@ -739,16 +741,16 @@ SDVersion ModelLoader::get_sd_version() const {
         if (has_distilled_guidance) {
             return VERSION_CHROMA;
         }
-        if (context_ebedding_weight.ne[0] == 3584) {
+        if (context_ebedding_weight.logical_ne0() == 3584) {
             return VERSION_LONGCAT;
         } else {
-            if (input_block_weight.ne[0] == 384) {
+            if (input_block_weight.logical_ne0() == 384) {
                 return VERSION_FLUX_FILL;
             }
-            if (input_block_weight.ne[0] == 128) {
+            if (input_block_weight.logical_ne0() == 128) {
                 return VERSION_FLUX_CONTROLS;
             }
-            if (input_block_weight.ne[0] == 196) {
+            if (input_block_weight.logical_ne0() == 196) {
                 return VERSION_FLEX_2;
             }
             return VERSION_FLUX;
@@ -788,14 +790,21 @@ SDVersion ModelLoader::get_sd_version() const {
     return VERSION_COUNT;
 }
 
+// The type a tensor will actually be loaded as: an override wins over the type
+// the file stores it in, so the reported stats match what runs.
+static ggml_type effective_wtype(const TensorStorage& tensor_storage) {
+    return tensor_storage.expected_type != GGML_TYPE_COUNT ? tensor_storage.expected_type
+                                                           : tensor_storage.type;
+}
+
 std::map<ggml_type, uint32_t> ModelLoader::get_wtype_stat() const {
     std::map<ggml_type, uint32_t> wtype_stat;
     for (auto& [name, tensor_storage] : tensor_storage_map) {
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -811,11 +820,11 @@ std::map<ggml_type, uint32_t> ModelLoader::get_conditioner_wtype_stat() const {
             continue;
         }
 
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -828,11 +837,11 @@ std::map<ggml_type, uint32_t> ModelLoader::get_diffusion_model_wtype_stat() cons
             continue;
         }
 
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -846,11 +855,11 @@ std::map<ggml_type, uint32_t> ModelLoader::get_vae_wtype_stat() const {
             continue;
         }
 
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -915,6 +924,22 @@ void ModelLoader::set_wtype_override(ggml_type wtype, std::string tensor_type_ru
     }
     invalidate_file_data();
     ++revision_;
+}
+
+// Convert every bf16 tensor to `dst_type`, ignoring the name exclusions of
+// tensor_should_be_converted: those keep norms, biases and embeddings at the
+// file's own type, which on a backend without bf16 means the load aborts.
+// Returns how many tensors were retyped.
+size_t ModelLoader::override_unsupported_bf16(ggml_type dst_type) {
+    size_t count = 0;
+    for (auto& [name, tensor_storage] : tensor_storage_map) {
+        if (tensor_storage.type != GGML_TYPE_BF16) {
+            continue;
+        }
+        tensor_storage.expected_type = dst_type;
+        count++;
+    }
+    return count;
 }
 
 void ModelLoader::process_model_files(bool enable_mmap, bool writable_mmap) {
@@ -1213,7 +1238,17 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
 
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back([&, file_path, is_zip]() {
-                std::ifstream file;
+ //               std::ifstream file;
+                // pread, not ifstream: stdio refills in st_blksize units (4 KiB here), which
+                // turns one tensor into thousands of device requests (201 MB/s vs 3.1 GB/s).
+                struct PosixFile {
+                    int fd = -1;
+                    ~PosixFile() {
+                        if (fd >= 0) {
+                            close(fd);
+                        }
+                    }
+                } posix_file;
                 zip_t* zip = nullptr;
                 if (is_zip) {
                     zip = zip_open(file_path.c_str(), 0, 'r');
@@ -1223,8 +1258,11 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                         return;
                     }
                 } else if (!mmapped) {
-                    file.open(std::filesystem::u8path(file_path), std::ios::binary);
-                    if (!file.is_open()) {
+                    // file.open(std::filesystem::u8path(file_path), std::ios::binary);
+                    // if (!file.is_open()) {
+                    posix_file.fd = open(file_path.c_str(), O_RDONLY);
+                    if (posix_file.fd < 0) {
+
                         LOG_ERROR("failed to open '%s'", file_path.c_str());
                         failed = true;
                         return;
@@ -1323,11 +1361,22 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                 return false;
                             }
                         } else {
-                            file.seekg(tensor_storage.offset);
-                            file.read(buf, n);
-                            if (!file) {
-                                LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
-                                return false;
+                            // file.seekg(tensor_storage.offset);
+                            // file.read(buf, n);
+                            // if (!file) {
+                            //     LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
+                            //     return false;
+                            size_t done = 0;
+                            while (done < n) {
+                                ssize_t got = pread(posix_file.fd,
+                                                    buf + done,
+                                                    n - done,
+                                                    (off_t)(tensor_storage.offset + done));
+                                if (got <= 0) {
+                                    LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
+                                    return false;
+                                }
+                                done += (size_t)got;
                             }
                         }
                         return true;
@@ -1669,7 +1718,8 @@ bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
 
 bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type) const {
     const std::string& name = tensor_storage.name;
-    if (tensor_storage.is_int8_tensorwise) {
+    if (tensor_storage.is_int8_tensorwise || tensor_storage.w4_convrot_kind != 0 ||
+        ends_with(name, ".weight_codebook") || ends_with(name, ".weight_s_channel") || ends_with(name, ".weight_s_rel")) {
         return false;
     }
     if (type != GGML_TYPE_COUNT) {
