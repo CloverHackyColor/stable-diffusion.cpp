@@ -289,16 +289,23 @@ namespace Qwen {
             h                           = modulate(ctx->ggml_ctx, h, modulation[2], prefix_length);
             ggml_tensor* gate;
             auto fused = blocks.find("img_mlp.gate_up");
-            if (fused != blocks.end()) {
+            static const bool swiglu_off = getenv("TOSH_QWEN21_SWIGLU_DISABLE") != nullptr;
+            if (fused != blocks.end() && !swiglu_off) {
+                // silu(gate) * up in one pass: chunking the fused output first copies both halves
                 auto gate_up = std::dynamic_pointer_cast<Linear>(fused->second)->forward(ctx, h);
-                auto parts   = ggml_ext_chunk(ctx->ggml_ctx, gate_up, 2, 0);
-                gate         = parts[0];
-                h            = parts[1];
+                h            = ggml_swiglu(ctx->ggml_ctx, gate_up);
             } else {
-                gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
-                h    = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.proj"])->forward(ctx, h);
+                if (fused != blocks.end()) {
+                    auto gate_up = std::dynamic_pointer_cast<Linear>(fused->second)->forward(ctx, h);
+                    auto parts   = ggml_ext_chunk(ctx->ggml_ctx, gate_up, 2, 0);
+                    gate         = parts[0];
+                    h            = parts[1];
+                } else {
+                    gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
+                    h    = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.proj"])->forward(ctx, h);
+                }
+                h = ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate));
             }
-            h = ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate));
             h = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.out"])->forward(ctx, h);
             return ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[3], prefix_length, true));
         }
