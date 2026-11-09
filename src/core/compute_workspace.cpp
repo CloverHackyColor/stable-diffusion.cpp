@@ -1,6 +1,7 @@
 #include "core/compute_workspace.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <map>
@@ -30,6 +31,11 @@ namespace sd {
 
     bool ComputeWorkspace::needs_scheduler(ggml_cgraph* graph) const {
         if (!extra_backends_.empty()) {
+            return true;
+        }
+        // escape hatch for a wave64 card that miscomputes an op supports_op accepts
+        static const bool forced = getenv("SD_TOSH_CPU_FALLBACK") != nullptr;
+        if (forced && !sd_backend_is_cpu(backend_)) {
             return true;
         }
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
