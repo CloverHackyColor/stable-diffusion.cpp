@@ -13,6 +13,14 @@
 
 TensorTypeRules parse_tensor_type_rules(const std::string& tensor_type_rules);
 
+void convert_tensor(void* src,
+                    ggml_type src_type,
+                    void* dst,
+                    ggml_type dst_type,
+                    int nrows,
+                    int n_per_row,
+                    std::vector<float> imatrix = {});
+
 class MmapWrapper;
 
 struct ModelFileData {
@@ -97,6 +105,8 @@ public:
     bool del_file(FileId id);
     uint64_t file_revision(FileId id) const;
     std::string file_path(FileId id) const;
+    std::map<std::string, std::string> file_metadata(FileId id) const;
+    String2TensorStorage file_tensors(FileId id) const;
     String2TensorStorage file_tensors(FileId id, SDVersion version) const;
     bool load_file_tensors(FileId id, SDVersion version, on_new_tensor_cb_t callback, const std::set<std::string>& names, bool use_mmap = false) const;
     bool refresh_files(bool include_isolated = true);
@@ -119,6 +129,7 @@ public:
     const std::map<std::string, std::string>& get_metadata() const { return metadata_; }
     void set_n_threads(int n_threads);
     void set_wtype_override(ggml_type wtype, std::string tensor_type_rules = "");
+    size_t override_unsupported_bf16(ggml_type dst_type);
     void process_model_files(bool enable_mmap = false, bool writable_mmap = true);
     std::vector<MmapTensorStore> mmap_tensors(std::map<std::string, ggml_tensor*>& tensors,
                                               std::set<std::string> ignore_tensors = {},

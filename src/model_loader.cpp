@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <mutex>
@@ -14,6 +15,9 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "core/util.h"
 #include "model_io/gguf_io.h"
@@ -115,7 +119,7 @@ void convert_tensor(void* src,
                     ggml_type dst_type,
                     int nrows,
                     int n_per_row,
-                    std::vector<float> imatrix = {}) {
+                    std::vector<float> imatrix) {
     int n = nrows * n_per_row;
     if (src_type == dst_type) {
         size_t nbytes = n * ggml_type_size(src_type) / ggml_blck_size(src_type);
@@ -131,6 +135,10 @@ void convert_tensor(void* src,
     } else if (dst_type == GGML_TYPE_F32) {
         if (src_type == GGML_TYPE_F16) {
             ggml_fp16_to_fp32_row((ggml_fp16_t*)src, (float*)dst, n);
+        } else if (src_type == GGML_TYPE_I32) {
+            for (int i = 0; i < n; i++) {
+                ((float*)dst)[i] = static_cast<float>(((int32_t*)src)[i]);
+            }
         } else {
             auto qtype = ggml_get_type_traits(src_type);
             if (qtype->to_float == nullptr) {
@@ -333,13 +341,13 @@ bool ModelLoader::init_from_safetensors_index_file(const std::string& file_path,
         }
     }
 
-    std::ifstream index_file(file_path);
+    std::ifstream index_file(std::filesystem::u8path(file_path));
     const auto index = nlohmann::json::parse(index_file);
     for (const auto& entry : index.at("weight_map").items()) {
         const auto expected = (std::filesystem::u8path(file_path).parent_path() /
                                std::filesystem::u8path(entry.value().get<std::string>()))
                                   .lexically_normal();
-        bool found = false;
+        bool found          = false;
         for (const auto& shard : parsed_tensor_names_) {
             if (std::filesystem::u8path(shard.first).lexically_normal() == expected) {
                 found = shard.second.count(entry.key()) != 0;
@@ -438,6 +446,37 @@ bool ModelLoader::init_from_diffusers_file(const std::string& file_path, const s
 SDVersion ModelLoader::get_sd_version() const {
     TensorStorage token_embedding_weight, input_block_weight, context_ebedding_weight;
 
+    if (tensor_storage_map.count("model.diffusion_model.perceiver.latent_queries")) {
+        return VERSION_FIBO2;
+    }
+
+    bool has_flux3_emb = false;
+    bool has_flux3_txt = false;
+    
+    for (const auto& pair : tensor_storage_map) {
+        const std::string& name = pair.first;
+        if (name.find("emb_in.image.weight") != std::string::npos) {
+            has_flux3_emb = true;
+        }
+        if (name.find("txt_mode_blocks") != std::string::npos || name.find("single_blocks") != std::string::npos) {
+            has_flux3_txt = true;
+        }
+        // Если нашли оба признака, прерываем цикл досрочно для скорости
+        if (has_flux3_emb && has_flux3_txt) {
+            break;
+        }
+    }
+    
+    if (has_flux3_emb && has_flux3_txt) {
+        return VERSION_FLUX3;
+    }
+    // =======================================================================
+
+    if (tensor_storage_map.count("model.diffusion_model.video_embedder.weight") &&
+        tensor_storage_map.count("model.diffusion_model.shared_block_modulation.weight")) {
+        return VERSION_MOSS_IMAGE;
+    }
+
     bool has_multiple_encoders = false;
     bool is_unet               = false;
 
@@ -453,6 +492,8 @@ SDVersion ModelLoader::get_sd_version() const {
     bool has_output_block_311        = false;
     bool has_output_block_71         = false;
     bool has_attn_1024               = false;
+    bool has_distilled_guidance      = false;
+    bool has_sdxl_add_embedding      = false;
 
     for (auto& [name, tensor_storage] : tensor_storage_map) {
         if (tensor_storage.name.find("model.diffusion_model.double_blocks.") != std::string::npos ||
@@ -471,6 +512,9 @@ SDVersion ModelLoader::get_sd_version() const {
         }
         if (tensor_storage.name.find("model.diffusion_model.nerf_final_layer_conv.") != std::string::npos) {
             return VERSION_CHROMA_RADIANCE;
+        }
+        if (tensor_storage.name.find("distilled_guidance_layer.in_proj.weight") != std::string::npos) {
+            has_distilled_guidance = true;
         }
         if (tensor_storage.name.find("model.diffusion_model.joint_blocks.") != std::string::npos) {
             return VERSION_SD3;
@@ -494,7 +538,7 @@ SDVersion ModelLoader::get_sd_version() const {
         }
         if (tensor_storage.name.find("model.diffusion_model.transformer_blocks.0.img_mod.1.weight") != std::string::npos) {
             auto img_in = tensor_storage_map.find("model.diffusion_model.img_in.weight");
-            if (img_in != tensor_storage_map.end() && img_in->second.ne[0] == 128) {
+            if (img_in != tensor_storage_map.end() && img_in->second.logical_ne0() == 128) {
                 return VERSION_MAGE_FLOW;
             }
             if (tensor_storage_map.find("model.diffusion_model.time_text_embed.addition_t_embedding.weight") != tensor_storage_map.end()) {
@@ -524,6 +568,12 @@ SDVersion ModelLoader::get_sd_version() const {
             return VERSION_LLADA_IMAGE;
         }
         if (tensor_storage.name.find("model.diffusion_model.cap_embedder.0.weight") != std::string::npos) {
+            if (tensor_storage_map.find("text_encoders.llm.connector.layers.0.self_attn.q_proj.weight") != tensor_storage_map.end()) {
+                return VERSION_MING_IMAGE;
+            }
+            if (tensor_storage_map.find("model.diffusion_model.local_decoder.out_conv.weight") != tensor_storage_map.end()) {
+                return VERSION_Z_IMAGE_L2P;
+            }
             return VERSION_Z_IMAGE;
         }
         if (tensor_storage.name.find("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight") != std::string::npos) {
@@ -548,7 +598,30 @@ SDVersion ModelLoader::get_sd_version() const {
         }
         if (tensor_storage.name.find("model.diffusion_model.video_patch_proj.weight") != std::string::npos &&
             tensor_storage_map.find("model.diffusion_model.audio_patch_proj.weight") != tensor_storage_map.end()) {
+            // P-H3 uses the same DiT architecture as H3; its VAE or connector identifies the image pipeline.
+            auto decoder = tensor_storage_map.find("first_stage_model.decoder.proj_out.weight");
+            if (decoder == tensor_storage_map.end()) {
+                decoder = tensor_storage_map.find("vae.decoder.proj_out.weight");
+            }
+            if (decoder != tensor_storage_map.end() && decoder->second.ne[1] == 768) {
+                return VERSION_P_H3_IMAGE;
+            }
+            for (const std::string prefix : {"", "embeddings_connectors."}) {
+                if (tensor_storage_map.count(prefix + "text_encoders.ph3_image_connector.proj.weight") ||
+                    tensor_storage_map.count(prefix + "text_encoders.llm.text_connector.proj.weight")) {
+                    return VERSION_P_H3_IMAGE;
+                }
+            }
+            auto connector = tensor_storage_map.find("embeddings_connectors.proj.weight");
+            if (connector != tensor_storage_map.end() && connector->second.logical_ne0() == 12800 &&
+                connector->second.ne[1] == 5120 && tensor_storage_map.count("embeddings_connectors.sink_embedding")) {
+                return VERSION_P_H3_IMAGE;
+            }
             return VERSION_MINIMAX_H3;
+        }
+        if (name == "model.diffusion_model.y_embedder.layer_pool.weight" &&
+            tensor_storage_map.count("model.diffusion_model.modulation_cores.adaln_img.weight")) {
+            return VERSION_IRIS;
         }
         if (tensor_storage.name.find("model.diffusion_model.blocks.0.cross_attn.norm_k.weight") != std::string::npos) {
             is_wan = true;
@@ -568,6 +641,7 @@ SDVersion ModelLoader::get_sd_version() const {
             has_img_emb = true;
         }
         if (tensor_storage.name.find("model.diffusion_model.input_blocks.") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.down_blocks.") != std::string::npos ||
             tensor_storage.name.find("unet.down_blocks.") != std::string::npos) {
             is_unet = true;
             if (has_multiple_encoders) {
@@ -582,22 +656,31 @@ SDVersion ModelLoader::get_sd_version() const {
                 is_xl = true;
             }
         }
+        // A standalone SDXL UNet (--diffusion-model) identifies the family by its added
+        // text/time embedding; its clip_g never carries a checkpoint prefix.
+        if (tensor_storage.name.find("model.diffusion_model.add_embedding.") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.label_emb.0.0.") != std::string::npos) {
+            has_sdxl_add_embedding = true;
+        }
         if (tensor_storage.name.find("model.diffusion_model.input_blocks.8.0.time_mixer.mix_factor") != std::string::npos) {
             return VERSION_SVD;
         }
         if (tensor_storage.name.find("model.diffusion_model.middle_block.1.") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.mid_block.resnets.1.") != std::string::npos ||
             tensor_storage.name.find("unet.mid_block.resnets.1.") != std::string::npos) {
             has_middle_block_1 = true;
         }
         if (tensor_storage.name.find("model.diffusion_model.output_blocks.3.1.transformer_blocks.1") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.up_blocks.1.attentions.0.transformer_blocks.1") != std::string::npos ||
             tensor_storage.name.find("unet.up_blocks.1.attentions.0.transformer_blocks.1") != std::string::npos) {
             has_output_block_311 = true;
         }
         if (tensor_storage.name.find("model.diffusion_model.output_blocks.7.1") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.up_blocks.2.attentions.1") != std::string::npos ||
             tensor_storage.name.find("unet.up_blocks.2.attentions.1") != std::string::npos) {
             has_output_block_71 = true;
             if (tensor_storage.name.find("model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn1.to_k.weight") != std::string::npos) {
-                if (tensor_storage.ne[0] == 1024)
+                if (tensor_storage.logical_ne0() == 1024)
                     has_attn_1024 = true;
             }
         }
@@ -611,6 +694,7 @@ SDVersion ModelLoader::get_sd_version() const {
             // break;
         }
         if (tensor_storage.name == "model.diffusion_model.input_blocks.0.0.weight" ||
+            tensor_storage.name == "model.diffusion_model.conv_in.weight" ||
             tensor_storage.name == "model.diffusion_model.img_in.weight" ||
             tensor_storage.name == "unet.conv_in.weight") {
             input_block_weight = tensor_storage;
@@ -620,7 +704,7 @@ SDVersion ModelLoader::get_sd_version() const {
         }
     }
     if (is_wan) {
-        LOG_VERBOSE("patch_embedding_channels %d", patch_embedding_channels);
+        LOG_DEBUG("patch_embedding_channels %d", patch_embedding_channels);
         if (is_s2v) {
             return VERSION_WAN2_2_S2V;
         }
@@ -634,6 +718,9 @@ SDVersion ModelLoader::get_sd_version() const {
     }
     bool is_inpaint = input_block_weight.ne[2] == 9;
     bool is_ip2p    = input_block_weight.ne[2] == 8;
+    if (is_unet && has_sdxl_add_embedding) {
+        is_xl = true;
+    }
     if (is_xl) {
         if (is_inpaint) {
             return VERSION_SDXL_INPAINT;
@@ -651,16 +738,19 @@ SDVersion ModelLoader::get_sd_version() const {
     }
 
     if (is_flux && !is_flux2) {
-        if (context_ebedding_weight.ne[0] == 3584) {
+        if (has_distilled_guidance) {
+            return VERSION_CHROMA;
+        }
+        if (context_ebedding_weight.logical_ne0() == 3584) {
             return VERSION_LONGCAT;
         } else {
-            if (input_block_weight.ne[0] == 384) {
+            if (input_block_weight.logical_ne0() == 384) {
                 return VERSION_FLUX_FILL;
             }
-            if (input_block_weight.ne[0] == 128) {
+            if (input_block_weight.logical_ne0() == 128) {
                 return VERSION_FLUX_CONTROLS;
             }
-            if (input_block_weight.ne[0] == 196) {
+            if (input_block_weight.logical_ne0() == 196) {
                 return VERSION_FLEX_2;
             }
             return VERSION_FLUX;
@@ -700,14 +790,21 @@ SDVersion ModelLoader::get_sd_version() const {
     return VERSION_COUNT;
 }
 
+// The type a tensor will actually be loaded as: an override wins over the type
+// the file stores it in, so the reported stats match what runs.
+static ggml_type effective_wtype(const TensorStorage& tensor_storage) {
+    return tensor_storage.expected_type != GGML_TYPE_COUNT ? tensor_storage.expected_type
+                                                           : tensor_storage.type;
+}
+
 std::map<ggml_type, uint32_t> ModelLoader::get_wtype_stat() const {
     std::map<ggml_type, uint32_t> wtype_stat;
     for (auto& [name, tensor_storage] : tensor_storage_map) {
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -723,11 +820,11 @@ std::map<ggml_type, uint32_t> ModelLoader::get_conditioner_wtype_stat() const {
             continue;
         }
 
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -740,11 +837,11 @@ std::map<ggml_type, uint32_t> ModelLoader::get_diffusion_model_wtype_stat() cons
             continue;
         }
 
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -758,11 +855,11 @@ std::map<ggml_type, uint32_t> ModelLoader::get_vae_wtype_stat() const {
             continue;
         }
 
-        auto iter = wtype_stat.find(tensor_storage.type);
+        auto iter = wtype_stat.find(effective_wtype(tensor_storage));
         if (iter != wtype_stat.end()) {
             iter->second++;
         } else {
-            wtype_stat[tensor_storage.type] = 1;
+            wtype_stat[effective_wtype(tensor_storage)] = 1;
         }
     }
     return wtype_stat;
@@ -827,6 +924,22 @@ void ModelLoader::set_wtype_override(ggml_type wtype, std::string tensor_type_ru
     }
     invalidate_file_data();
     ++revision_;
+}
+
+// Convert every bf16 tensor to `dst_type`, ignoring the name exclusions of
+// tensor_should_be_converted: those keep norms, biases and embeddings at the
+// file's own type, which on a backend without bf16 means the load aborts.
+// Returns how many tensors were retyped.
+size_t ModelLoader::override_unsupported_bf16(ggml_type dst_type) {
+    size_t count = 0;
+    for (auto& [name, tensor_storage] : tensor_storage_map) {
+        if (tensor_storage.type != GGML_TYPE_BF16) {
+            continue;
+        }
+        tensor_storage.expected_type = dst_type;
+        count++;
+    }
+    return count;
 }
 
 void ModelLoader::process_model_files(bool enable_mmap, bool writable_mmap) {
@@ -1125,7 +1238,17 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
 
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back([&, file_path, is_zip]() {
-                std::ifstream file;
+ //               std::ifstream file;
+                // pread, not ifstream: stdio refills in st_blksize units (4 KiB here), which
+                // turns one tensor into thousands of device requests (201 MB/s vs 3.1 GB/s).
+                struct PosixFile {
+                    int fd = -1;
+                    ~PosixFile() {
+                        if (fd >= 0) {
+                            close(fd);
+                        }
+                    }
+                } posix_file;
                 zip_t* zip = nullptr;
                 if (is_zip) {
                     zip = zip_open(file_path.c_str(), 0, 'r');
@@ -1135,8 +1258,11 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                         return;
                     }
                 } else if (!mmapped) {
-                    file.open(file_path, std::ios::binary);
-                    if (!file.is_open()) {
+                    // file.open(std::filesystem::u8path(file_path), std::ios::binary);
+                    // if (!file.is_open()) {
+                    posix_file.fd = open(file_path.c_str(), O_RDONLY);
+                    if (posix_file.fd < 0) {
+
                         LOG_ERROR("failed to open '%s'", file_path.c_str());
                         failed = true;
                         return;
@@ -1235,11 +1361,22 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                 return false;
                             }
                         } else {
-                            file.seekg(tensor_storage.offset);
-                            file.read(buf, n);
-                            if (!file) {
-                                LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
-                                return false;
+                            // file.seekg(tensor_storage.offset);
+                            // file.read(buf, n);
+                            // if (!file) {
+                            //     LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
+                            //     return false;
+                            size_t done = 0;
+                            while (done < n) {
+                                ssize_t got = pread(posix_file.fd,
+                                                    buf + done,
+                                                    n - done,
+                                                    (off_t)(tensor_storage.offset + done));
+                                if (got <= 0) {
+                                    LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
+                                    return false;
+                                }
+                                done += (size_t)got;
                             }
                         }
                         return true;
@@ -1581,7 +1718,8 @@ bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
 
 bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type) const {
     const std::string& name = tensor_storage.name;
-    if (tensor_storage.is_int8_tensorwise) {
+    if (tensor_storage.is_int8_tensorwise || tensor_storage.w4_convrot_kind != 0 ||
+        ends_with(name, ".weight_codebook") || ends_with(name, ".weight_s_channel") || ends_with(name, ".weight_s_rel")) {
         return false;
     }
     if (type != GGML_TYPE_COUNT) {

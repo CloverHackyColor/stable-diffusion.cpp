@@ -1,6 +1,7 @@
 #ifndef __SD_MODEL_ADAPTER_LORA_HPP__
 #define __SD_MODEL_ADAPTER_LORA_HPP__
 
+#include <cmath>
 #include <mutex>
 #include "core/ggml_extend.h"
 #include "core/ggml_extend_backend.h"
@@ -11,15 +12,18 @@
 #include "model/adapter/lora_ops.h"
 #include "model_loader.h"
 #include "model_manager.h"
+#include "name_conversion.h"
 
 #define LORA_GRAPH_BASE_SIZE 10240
 
 struct LoraModel : public GGMLRunner {
     std::string lora_id;
-    float multiplier = 1.0f;
+    float multiplier     = 1.0f;
+    float metadata_alpha = -1.f;
     std::unordered_map<std::string, ggml_tensor*> lora_tensors;
     std::map<ggml_tensor*, ggml_tensor*> original_tensor_to_final_tensor;
     std::set<std::string> applied_lora_tensors;
+    std::set<std::string> swapped_lora_up_tensors;
     std::set<std::string> skipped_incompatible_lora_tensors;
     std::set<std::string> warned_incompatible_model_tensors;
     std::string file_path;
@@ -62,6 +66,32 @@ struct LoraModel : public GGMLRunner {
         if (load_failed || !registered_params.empty())
             return false;
         model_manager->set_n_threads(n_threads);
+        metadata_alpha      = -1.f;
+        const auto metadata = model_manager->loader().file_metadata(source_file);
+        const auto alpha    = metadata.find("alpha");
+        // Converters that write "baked_scale" have already folded alpha / rank into lora_up.
+        if (alpha != metadata.end() && metadata.find("baked_scale") == metadata.end()) {
+            try {
+                size_t parsed  = 0;
+                metadata_alpha = std::stof(alpha->second, &parsed);
+                if (parsed != alpha->second.size() || !std::isfinite(metadata_alpha) || metadata_alpha < 0.f) {
+                    throw std::invalid_argument("invalid alpha");
+                }
+            } catch (const std::exception&) {
+                LOG_ERROR("invalid LoRA alpha metadata '%s' in '%s'", alpha->second.c_str(), file_path.c_str());
+                return false;
+            }
+            LOG_VERBOSE("LoRA '%s' uses metadata alpha %.6g when tensor alpha/scale is absent", file_path.c_str(), metadata_alpha);
+        }
+        if (sd_version_is_minimax_h3(source_version)) {
+            for (const auto& entry : model_manager->loader().file_tensors(source_file)) {
+                const auto name = convert_tensor_name(entry.first, VERSION_COUNT);
+                if (ends_with(name, ".ff.net.0.proj.weight.lora_up")) {
+                    // Diffusers SwiGLU stores [value, gate]; MiniMax-H3 uses [gate, value].
+                    swapped_lora_up_tensors.insert(convert_tensor_name(entry.first, source_version));
+                }
+            }
+        }
         const auto sources = model_manager->loader().file_tensors(source_file, source_version);
         std::map<std::string, ggml_tensor*> tensors;
         std::map<std::string, ggml_tensor*> scalars;
@@ -116,6 +146,8 @@ struct LoraModel : public GGMLRunner {
         scalar_values.clear();
         original_tensor_to_final_tensor.clear();
         applied_lora_tensors.clear();
+        swapped_lora_up_tensors.clear();
+        metadata_alpha = -1.f;
         skipped_incompatible_lora_tensors.clear();
         warned_incompatible_model_tensors.clear();
         applied             = false;
@@ -210,6 +242,10 @@ struct LoraModel : public GGMLRunner {
             auto iter = lora_tensors.find(lora_up_name);
             if (iter != lora_tensors.end()) {
                 lora_up = ggml_ext_cast_f32(ctx, backend, iter->second);
+                if (swapped_lora_up_tensors.count(lora_up_name)) {
+                    auto halves = ggml_ext_chunk(ctx, lora_up, 2, 1);
+                    lora_up     = ggml_concat(ctx, halves[1], halves[0], 1);
+                }
             }
 
             iter = lora_tensors.find(lora_mid_name);
@@ -236,6 +272,7 @@ struct LoraModel : public GGMLRunner {
             float scale_value = 1.0f;
 
             int64_t rank = lora_down->ne[ggml_n_dims(lora_down) - 1];
+            scale_value  = metadata_alpha >= 0.f ? metadata_alpha / rank : 1.f;
             iter         = lora_tensors.find(scale_name);
             if (iter != lora_tensors.end()) {
                 scale_value = scalar_value(iter->second);
@@ -723,6 +760,10 @@ struct LoraModel : public GGMLRunner {
             iter = lora_tensors.find(lora_up_name);
             if (iter != lora_tensors.end()) {
                 lora_up = iter->second;
+                if (swapped_lora_up_tensors.count(lora_up_name)) {
+                    auto halves = ggml_ext_chunk(ctx, lora_up, 2, 1);
+                    lora_up     = ggml_concat(ctx, halves[1], halves[0], 1);
+                }
                 if (is_conv2d && lora_up->type != GGML_TYPE_F16) {
                     lora_up = ggml_cast(ctx, lora_up, GGML_TYPE_F16);
                 }
@@ -791,6 +832,7 @@ struct LoraModel : public GGMLRunner {
             std::string scale_tensor_name;
 
             int64_t rank = lora_down->ne[ggml_n_dims(lora_down) - 1];
+            scale_value  = metadata_alpha >= 0.f ? metadata_alpha / rank : 1.f;
             iter         = lora_tensors.find(scale_name);
             if (iter != lora_tensors.end()) {
                 scale_value       = scalar_value(iter->second);
@@ -931,7 +973,9 @@ struct LoraModel : public GGMLRunner {
             }
 
             ggml_tensor* final_tensor;
-            if (model_tensor->type != GGML_TYPE_F32 && model_tensor->type != GGML_TYPE_F16) {
+            // f16 takes the same f32 round trip as the quantized types: the diff is f32, and a
+            // backend without host-visible weights cannot fall back to the CPU for a mixed add.            
+            if (model_tensor->type != GGML_TYPE_F32) {
                 final_tensor = ggml_ext_cast_f32(compute_ctx, runtime_backend, model_tensor);
                 final_tensor = ggml_add_inplace(compute_ctx, final_tensor, diff);
                 final_tensor = ggml_cpy(compute_ctx, final_tensor, model_tensor);
@@ -1026,7 +1070,7 @@ public:
                 continue;
             }
 
-            if (weight->type != GGML_TYPE_F32 && weight->type != GGML_TYPE_F16) {
+            if (weight->type != GGML_TYPE_F32) {
                 weight = ggml_ext_cast_f32(ctx, backend, weight);
             }
             weight = ggml_add(ctx, weight, diff);
@@ -1085,6 +1129,16 @@ public:
                                     ggml_tensor* output,
                                     const std::string& prefix,
                                     WeightAdapter::ForwardParams forward_params) override {
+        // Packed INT4 stores half the logical input width. Adapter shape checks
+        // and reshapes need the logical weight dimensions, without decoding it.
+        ggml_tensor logical_weight = *w;
+        if (forward_params.op_type == WeightAdapter::ForwardParams::op_type_t::OP_LINEAR &&
+            w->type == GGML_TYPE_I8 && x->ne[0] == 2 * w->ne[0]) {
+            logical_weight.ne[0] = x->ne[0];
+            for (int i = 1; i < GGML_MAX_DIMS; ++i)
+                logical_weight.nb[i] = logical_weight.nb[i - 1] * logical_weight.ne[i - 1];
+            w = &logical_weight;
+        }
         for (auto& lora_model : lora_models) {
             ggml_tensor* weight_diff = lora_model->get_weight_diff(prefix + "weight", backend, ctx, w, false);
             if (weight_diff != nullptr) {
