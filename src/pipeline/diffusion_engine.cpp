@@ -106,6 +106,10 @@ const char* model_version_to_str[] = {
     "LLaDA-Image",
     "ESRGAN",
     "PixArt",
+    "Ming-Image",   
+    "Z-Image-L2P",
+    "Iris",
+    "Flux3",
 };
 
 static_assert(VERSION_COUNT == sizeof(model_version_to_str) / sizeof(model_version_to_str[0]),

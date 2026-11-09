@@ -2160,6 +2160,10 @@ struct LLMEmbedder : public Conditioner {
             weights.insert(weights.end(), curr_tokens.size(), curr_weight);
         }
 
+        if (sd_version_is_flux3(version)) {
+            min_length = std::min(max_length, ((tokens.size() + 79) / 80) * 80);
+        }
+
         std::vector<float> mask;
         tokenizer->pad_tokens(tokens, &weights, &mask, min_length, max_length);
 
